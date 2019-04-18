@@ -13,7 +13,6 @@ import (
 	"runtime/pprof"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/BTrDB/btrdb"
@@ -51,25 +50,6 @@ var (
 
 var points_sent uint32 = 0
 
-var points_received uint32 = 0
-
-var points_verified uint32 = 0
-
-type TransactionData struct {
-	sendTime int64
-	respTime int64
-}
-
-type ConnectionID struct {
-	serverIndex     int
-	connectionIndex int
-}
-
-type ConnStream struct {
-	conn   *btrdb.BTrDB
-	stream *btrdb.Stream
-}
-
 var get_time_value func(int64, *rand.Rand) float64
 
 func getRandValue(time int64, randGen *rand.Rand) float64 {
@@ -86,41 +66,9 @@ func getSinusoidValue(time int64, randGen *rand.Rand) float64 {
 	return sines[sinesIndex]
 }
 
-func insert_data(uuid []byte, start *int64, s *btrdb.Stream,
-	sendLock *sync.Mutex, connID ConnectionID, response chan ConnectionID,
-	streamID int, cont chan uint32, randGen *rand.Rand,
-	permutation []int64, numMessages uint64, history []TransactionData) {
-	var currTime int64 = *start
-	var j uint64
+func insert_data(s *btrdb.Stream, sig chan int) {
 
-	for j = 0; j < numMessages; j++ {
-		currTime = permutation[j]
-
-		data := make([]btrdb.RawPoint, POINTS_PER_MESSAGE)
-		var i int
-		for i = 0; uint32(i) < POINTS_PER_MESSAGE; i++ {
-			if DETERMINISTIC_KV {
-				data[i] = btrdb.RawPoint{Time: currTime, Value: get_time_value(currTime, randGen)}
-			} else {
-				data[i] = btrdb.RawPoint{Time: (currTime + int64(randGen.Float64()*MAX_TIME_RANDOM_OFFSET)), Value: get_time_value(currTime, randGen)}
-			}
-			currTime += NANOS_BETWEEN_POINTS
-		}
-
-		sendLock.Lock()
-		sendErr := s.Insert(context.Background(), data)
-		sendLock.Unlock()
-		if GET_MESSAGE_TIMES { // write send time to history
-			history[j].sendTime = time.Now().UnixNano()
-		}
-
-		if sendErr != nil {
-			fmt.Printf("Error in sending request: %v\n", sendErr)
-			return
-		}
-		atomic.AddUint32(&points_sent, POINTS_PER_MESSAGE)
-	}
-	response <- connID
+	sig <- 0
 }
 
 func getIntFromConfig(key string, config map[string]interface{}) int64 {
@@ -152,11 +100,9 @@ func bitLength(x int64) uint {
 
 func main() {
 	args := os.Args[1:]
-	var send_messages func([]byte, *int64, *btrdb.Stream, *sync.Mutex, ConnectionID, chan ConnectionID, int, chan uint32, *rand.Rand, []int64, uint64, []TransactionData)
 
 	if len(args) > 0 && args[0] == "-i" {
 		fmt.Println("Insert mode")
-		send_messages = insert_data
 	} else {
 		fmt.Println("Usage: use -i to insert data. To get a CPU profile, add a file name after -i.")
 		return
@@ -188,23 +134,16 @@ func main() {
 	}
 
 	TOTAL_RECORDS = getIntFromConfig("TOTAL_RECORDS", config)
-	TCP_CONNECTIONS = int(getIntFromConfig("TCP_CONNECTIONS", config))
 	POINTS_PER_MESSAGE = uint32(getIntFromConfig("POINTS_PER_MESSAGE", config))
 	NANOS_BETWEEN_POINTS = getIntFromConfig("NANOS_BETWEEN_POINTS", config)
-	NUM_SERVERS = int(getIntFromConfig("NUM_SERVERS", config))
 	NUM_STREAMS = int(getIntFromConfig("NUM_STREAMS", config))
 	FIRST_TIME = getIntFromConfig("FIRST_TIME", config)
 	RAND_SEED = getIntFromConfig("RAND_SEED", config)
 	PERM_SEED = getIntFromConfig("PERM_SEED", config)
 	var maxConcurrentMessages int64 = getIntFromConfig("MAX_CONCURRENT_MESSAGES", config)
 	var timeRandOffset int64 = getIntFromConfig("MAX_TIME_RANDOM_OFFSET", config)
-	var pw int64 = getIntFromConfig("STATISTICAL_PW", config)
-	if TOTAL_RECORDS <= 0 || TCP_CONNECTIONS <= 0 || POINTS_PER_MESSAGE <= 0 || NANOS_BETWEEN_POINTS <= 0 || NUM_STREAMS <= 0 || maxConcurrentMessages <= 0 {
+	if TOTAL_RECORDS <= 0 || POINTS_PER_MESSAGE <= 0 || NANOS_BETWEEN_POINTS <= 0 || NUM_STREAMS <= 0 || maxConcurrentMessages <= 0 {
 		fmt.Println("TOTAL_RECORDS, TCP_CONNECTIONS, POINTS_PER_MESSAGE, NANOS_BETWEEN_POINTS, NUM_STREAMS, and MAX_CONCURRENT_MESSAGES must be positive.")
-		os.Exit(1)
-	}
-	if pw < -1 {
-		fmt.Println("STATISTICAL_PW cannot be less than -1.")
 		os.Exit(1)
 	}
 	if (TOTAL_RECORDS % int64(POINTS_PER_MESSAGE)) != 0 {
@@ -223,22 +162,11 @@ func main() {
 		fmt.Println("MAX_TIME_RANDOM_OFFSET must be nonnegative.")
 		os.Exit(1)
 	}
-	if VERIFY_RESPONSES && maxConcurrentMessages != 1 {
-		fmt.Println("WARNING: MAX_CONCURRENT_MESSAGES is always 1 when verifying responses.")
-		maxConcurrentMessages = 1
-	}
 	var nanosPerMessage uint64 = uint64(NANOS_BETWEEN_POINTS) * uint64(POINTS_PER_MESSAGE)
-	if VERIFY_RESPONSES && statistical && ((nanosPerMessage&uint64(statisticalBitmaskLower)) != 0 || (FIRST_TIME&statisticalBitmaskLower) != 0) {
-		fmt.Println("ERROR: When verifying statistical responses, NANOS_BETWEEN_POINTS * POINTS_PER_MESSAGE (the ns in each query) and FIRST_TIME must be multiples of 2 ^ STATISTICAL_PW.")
-		return
-	}
+
 	MAX_CONCURRENT_MESSAGES = uint64(maxConcurrentMessages)
 	MAX_TIME_RANDOM_OFFSET = float64(timeRandOffset)
 	DETERMINISTIC_KV = (config["DETERMINISTIC_KV"].(string) == "true")
-	if VERIFY_RESPONSES && PERM_SEED != 0 && !DETERMINISTIC_KV {
-		fmt.Println("ERROR: PERM_SEED must be set to 0 when verifying nondeterministic responses.")
-		return
-	}
 	GET_MESSAGE_TIMES = (config["GET_MESSAGE_TIMES"].(string) == "true")
 	if DETERMINISTIC_KV {
 		get_time_value = getSinusoidValue
@@ -269,18 +197,12 @@ func main() {
 	var ok bool
 	var dbAddrStr interface{}
 	var dbAddrs []string = make([]string, NUM_SERVERS)
-	for j = 0; j < NUM_SERVERS; j++ {
-		dbAddrStr, ok = config[fmt.Sprintf("DB_ADDR%v", j+1)]
-		if !ok {
-			break
-		}
-		dbAddrs[j] = dbAddrStr.(string)
-	}
-	_, ok = config[fmt.Sprintf("DB_ADDR%v", j+1)]
-	if j != NUM_SERVERS || ok {
-		fmt.Println("The number of specified DB_ADDRs must equal NUM_SERVERS.")
+	dbAddrStr, ok = config["DB_ADDR"]
+	if !ok {
+		fmt.Println("DB_ADDR cannot be found")
 		os.Exit(1)
 	}
+	dbAddrs[j] = dbAddrStr.(string)
 
 	var uuids [][]byte = make([][]byte, NUM_STREAMS)
 
@@ -310,9 +232,11 @@ func main() {
 	fmt.Printf("\n")
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	var connections [][]ConnStream = make([][]ConnStream, NUM_SERVERS)
-	var sendLocks [][]*sync.Mutex = make([][]*sync.Mutex, NUM_SERVERS)
-	var recvLocks [][]*sync.Mutex = make([][]*sync.Mutex, NUM_SERVERS)
+	var connections []*btrdb.Stream = make([]*btrdb.Stream, NUM_STREAMS)
+	var sendLocks []*sync.Mutex = make([]*sync.Mutex, NUM_STREAMS)
+	var recvLocks []*sync.Mutex = make([]*sync.Mutex, NUM_STREAMS)
+	var positions []uint64 = make([]uint64, NUM_STREAMS)
+	var datas [][]btrdb.RawPoint = make([][]btrdb.RawPoint, uint64(perm_size))
 
 	d, err := btrdb.Connect(context.TODO(), dbAddrs[0])
 	if err != nil {
@@ -320,58 +244,25 @@ func main() {
 		os.Exit(1)
 	}
 	for j = 0; j < NUM_STREAMS; j++ {
-		_, err := d.Create(context.Background(), uuid.UUID(uuids[j]), uuid.UUID(uuids[j]).String(), nil, nil)
+		s, err := d.Create(context.Background(), uuid.UUID(uuids[j]), uuid.UUID(uuids[j]).String(), nil, nil)
 		if err != nil {
 			fmt.Printf("Could not create stream: %s\n", err)
 			os.Exit(1)
-
 		}
+		connections[j] = s
 	}
 
-	for s := range dbAddrs {
-		connections[s] = make([]ConnStream, TCP_CONNECTIONS)
-		sendLocks[s] = make([]*sync.Mutex, TCP_CONNECTIONS)
-		recvLocks[s] = make([]*sync.Mutex, TCP_CONNECTIONS)
-		for i := range connections[s] {
-			db, err := btrdb.Connect(context.TODO(), dbAddrs[s])
-			if err != nil {
-				fmt.Printf("Could not connect to database: %s\n", err)
-				os.Exit(1)
-			}
-			fmt.Printf("Creating connections to %v...\n", dbAddrs[s])
-			connections[s][i] = ConnStream{conn: db, stream: db.StreamFromUUID(uuid.UUID(uuids[i%NUM_STREAMS]))}
-			sendLocks[s][i] = &sync.Mutex{}
-			recvLocks[s][i] = &sync.Mutex{}
-
-		}
-	}
 	fmt.Println("Finished creating connections")
 
-	var serverIndex int = 0
-	var streamCounts []int = make([]int, NUM_SERVERS)
-	var connIndex int
-
-	var sig chan ConnectionID = make(chan ConnectionID)
-	var usingConn [][]int = make([][]int, NUM_SERVERS)
-	for y := 0; y < NUM_SERVERS; y++ {
-		usingConn[y] = make([]int, TCP_CONNECTIONS)
-	}
+	var sig chan int = make(chan int)
 	var idToChannel []chan uint32 = make([]chan uint32, NUM_STREAMS)
 	var cont chan uint32
 	var randGen *rand.Rand
 	var startTimes []int64 = make([]int64, NUM_STREAMS)
 	var perm [][]int64 = make([][]int64, NUM_STREAMS)
 
-	var transactionHistories [][]TransactionData = make([][]TransactionData, NUM_STREAMS)
-	for p := range transactionHistories {
-		if GET_MESSAGE_TIMES {
-			transactionHistories[p] = make([]TransactionData, perm_size)
-		} else {
-			transactionHistories[p] = nil
-		}
-	}
-
 	var f int64
+	var u int64
 	for e := 0; e < NUM_STREAMS; e++ {
 		perm[e] = make([]int64, perm_size)
 		if PERM_SEED == 0 {
@@ -387,21 +278,38 @@ func main() {
 	}
 	fmt.Println("Finished generating insert/query order")
 
+	for e := 0; e < NUM_STREAMS; e++ {
+		for u = 0; u < perm_size; u++ {
+			currTime := perm[e][u]
+
+			data := make([]btrdb.RawPoint, POINTS_PER_MESSAGE)
+			var i int
+			for i = 0; uint32(i) < POINTS_PER_MESSAGE; i++ {
+				if DETERMINISTIC_KV {
+					data[i] = btrdb.RawPoint{Time: currTime, Value: get_time_value(currTime, randGen)}
+				} else {
+					data[i] = btrdb.RawPoint{Time: (currTime + int64(randGen.Float64()*MAX_TIME_RANDOM_OFFSET)), Value: get_time_value(currTime, randGen)}
+				}
+				currTime += NANOS_BETWEEN_POINTS
+			}
+			datas[j] = data
+		}
+	}
+
 	var finished bool = false
 
 	var startTime int64 = time.Now().UnixNano()
 
 	for z := 0; z < NUM_STREAMS; z++ {
 		cont = make(chan uint32, maxConcurrentMessages)
-		idToChannel[z] = cont
-		randGen = rand.New(rand.NewSource(seedGen.Int63()))
-		randGens[z] = randGen
-		startTimes[z] = FIRST_TIME
-		serverIndex = getServer(uuids[z])
-		connIndex = streamCounts[serverIndex] % TCP_CONNECTIONS
-		go send_messages(uuids[z], &startTimes[z], connections[serverIndex][connIndex].stream, sendLocks[serverIndex][connIndex], ConnectionID{serverIndex, connIndex}, sig, z, cont, randGen, perm[z], uint64(perm_size), transactionHistories[z])
-		usingConn[serverIndex][connIndex]++
-		streamCounts[serverIndex]++
+		for i := 0; i < TCP_CONNECTIONS; i++ {
+			randGen = rand.New(rand.NewSource(seedGen.Int63()))
+			randGens[z] = randGen
+			startTimes[z] = FIRST_TIME
+			// datas sig cont
+			go send_messages(uuids[z], &startTimes[z], connections[serverIndex][connIndex].stream, sendLocks[serverIndex][connIndex], ConnectionID{serverIndex, connIndex}, sig, z, cont, randGen, perm[z], uint64(perm_size), transactionHistories[z])
+
+		}
 	}
 
 	/* Handle ^C */
@@ -417,25 +325,8 @@ func main() {
 		os.Exit(0)
 	}()
 
-	go func() {
-		for !finished {
-			time.Sleep(time.Second)
-			fmt.Printf("Sent %v, ", points_sent)
-			atomic.StoreUint32(&points_sent, 0)
-			points_received = 0
-		}
-	}()
-
-	var response ConnectionID
-	for k := 0; k < NUM_STREAMS; k++ {
-		response = <-sig
-		serverIndex = response.serverIndex
-		connIndex = response.connectionIndex
-		usingConn[serverIndex][connIndex]--
-		if usingConn[serverIndex][connIndex] == 0 {
-			connections[serverIndex][connIndex].conn.Disconnect()
-			fmt.Printf("Closed connection %v to server %v\n", connIndex, dbAddrs[serverIndex])
-		}
+	for k := 0; k < NUM_STREAMS*TCP_CONNECTIONS; k++ {
+		_ = <-sig
 	}
 
 	var deltaT int64 = time.Now().UnixNano() - startTime
