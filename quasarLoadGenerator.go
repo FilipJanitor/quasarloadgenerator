@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"github.com/BTrDB/btrdb"
+	pb "github.com/BTrDB/btrdb/grpcinterface"
 	cparse "github.com/SoftwareDefinedBuildings/sync2_quasar/configparser"
 	"github.com/pborman/uuid"
+	"google.golang.org/grpc"
 )
 
 // remember to add EXTERNAL_ADDRESS to apifrontend as env variable to avoid calling localhost
@@ -48,6 +50,27 @@ var (
 	PRINT_ALL        = false
 )
 
+type Endpoint struct {
+	g    pb.BTrDBClient
+	conn *grpc.ClientConn
+}
+
+//Error() implements the error interface
+func (ce *CodedError) Error() string {
+	return fmt.Sprintf("[%d] %s", ce.Code, ce.Msg)
+}
+
+//ToCodedError can be used to convert any error into a CodedError. If the
+//error object is actually not coded, it will receive code 501.
+func ToCodedError(e error) *CodedError {
+	ce, ok := e.(*CodedError)
+	if ok {
+		return ce
+	}
+	s := pb.Status{Code: 501, Msg: e.Error()}
+	return &CodedError{&s}
+}
+
 var points_sent uint32 = 0
 
 var get_time_value func(int64, *rand.Rand) float64
@@ -55,6 +78,10 @@ var get_time_value func(int64, *rand.Rand) float64
 func getRandValue(time int64, randGen *rand.Rand) float64 {
 	// We technically don't need time anymore, but if we switch back to a sine wave later it's useful to keep it around as a parameter
 	return randGen.NormFloat64()
+}
+
+type CodedError struct {
+	*pb.Status
 }
 
 var sines [100]float64
@@ -66,7 +93,7 @@ func getSinusoidValue(time int64, randGen *rand.Rand) float64 {
 	return sines[sinesIndex]
 }
 
-func insert_data(datas [][]btrdb.RawPoint, startTime *int64, con chan uint32,
+func insert_data(datas [][]pb.RawPoint, startTime *int64, con chan uint32,
 	sig chan int, sendLock *sync.Mutex, recvLock *sync.Mutex, perm_size int64,
 	s *btrdb.Stream) {
 	var current int64 = 0
@@ -354,4 +381,48 @@ func main() {
 	}
 	fmt.Printf("Average: %d nanoseconds per point (floored to integer value)\n", average)
 	fmt.Println(deltaT)
+}
+
+//connector
+func connector(a string) *Endpoint {
+	var tmt time.Duration
+	tmt = 2 * time.Second
+
+	dc := grpc.NewGZIPDecompressor()
+	dialopts := []grpc.DialOption{
+		grpc.WithTimeout(tmt),
+		grpc.FailOnNonTempDialError(true),
+		grpc.WithBlock(),
+		grpc.WithDecompressor(dc),
+		grpc.WithInitialWindowSize(1 * 1024 * 1024),
+		grpc.WithInitialConnWindowSize(1 * 1024 * 1024)}
+
+	dialopts = append(dialopts, grpc.WithInsecure())
+	conn, err := grpc.Dial(a, dialopts...)
+	if err != nil {
+		fmt.Printf("endpoint error: err=%v a=%v\n", err, a)
+		os.Exit(0)
+	}
+	client := pb.NewBTrDBClient(conn)
+	rv := &Endpoint{g: client, conn: conn}
+	return rv
+}
+
+func inserter(c pb.BTrDBClient, uu uuid.UUID, values []*pb.RawPoint) error {
+	rv, err := c.Insert(context.Background(), &pb.InsertParams{
+		Uuid:   uu,
+		Sync:   false,
+		Values: values,
+	})
+	if err != nil {
+		return err
+	}
+	if rv.GetStat() != nil {
+		return &CodedError{rv.GetStat()}
+	}
+	return nil
+}
+
+func destroy(b *grpc.ClientConn) {
+	b.Close()
 }
