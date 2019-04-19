@@ -19,6 +19,7 @@ import (
 	"github.com/pborman/uuid"
 )
 
+// remember to add EXTERNAL_ADDRESS to apifrontend as env variable to avoid calling localhost
 var (
 	TOTAL_RECORDS           int64
 	TCP_CONNECTIONS         int
@@ -69,22 +70,27 @@ func insert_data(datas [][]btrdb.RawPoint, startTime *int64, con chan uint32,
 	sig chan int, sendLock *sync.Mutex, recvLock *sync.Mutex, perm_size int64,
 	s *btrdb.Stream) {
 	var current int64 = 0
+	recvLock.Lock()
+	current = *startTime
+	*startTime++
+	recvLock.Unlock()
 	for current < perm_size {
-		recvLock.Lock()
-		current = *startTime
-		*startTime++
-		recvLock.Unlock()
 
 		con <- 0
-		//sendLock.Lock()
-		go func() {
-			sendErr := s.Insert(context.Background(), datas[current])
+
+		go func(c int64) {
+			sendErr := s.Insert(context.Background(), datas[c])
 			<-con
 			if sendErr != nil {
 				fmt.Printf("Error in sending request: %v\n", sendErr)
 				os.Exit(1)
 			}
-		}()
+		}(current)
+
+		recvLock.Lock()
+		current = *startTime
+		*startTime++
+		recvLock.Unlock()
 
 	}
 	sig <- 0
@@ -141,12 +147,13 @@ func main() {
 	POINTS_PER_MESSAGE = uint32(getIntFromConfig("POINTS_PER_MESSAGE", config))
 	NANOS_BETWEEN_POINTS = getIntFromConfig("NANOS_BETWEEN_POINTS", config)
 	NUM_STREAMS = int(getIntFromConfig("NUM_STREAMS", config))
+	TCP_CONNECTIONS = int(getIntFromConfig("TCP_CONNECTIONS", config))
 	FIRST_TIME = getIntFromConfig("FIRST_TIME", config)
 	RAND_SEED = getIntFromConfig("RAND_SEED", config)
 	PERM_SEED = getIntFromConfig("PERM_SEED", config)
 	var maxConcurrentMessages int64 = getIntFromConfig("MAX_CONCURRENT_MESSAGES", config)
 	var timeRandOffset int64 = getIntFromConfig("MAX_TIME_RANDOM_OFFSET", config)
-	if TOTAL_RECORDS <= 0 || POINTS_PER_MESSAGE <= 0 || NANOS_BETWEEN_POINTS <= 0 || NUM_STREAMS <= 0 || maxConcurrentMessages <= 0 {
+	if TOTAL_RECORDS <= 0 || TCP_CONNECTIONS <= 0 || POINTS_PER_MESSAGE <= 0 || NANOS_BETWEEN_POINTS <= 0 || NUM_STREAMS <= 0 || maxConcurrentMessages <= 0 {
 		fmt.Println("TOTAL_RECORDS, TCP_CONNECTIONS, POINTS_PER_MESSAGE, NANOS_BETWEEN_POINTS, NUM_STREAMS, and MAX_CONCURRENT_MESSAGES must be positive.")
 		os.Exit(1)
 	}
@@ -226,10 +233,13 @@ func main() {
 	datas := make([][]btrdb.RawPoint, uint64(perm_size))
 
 	d, err := btrdb.Connect(context.TODO(), dbAddr)
+
 	if err != nil {
 		fmt.Printf("Could not connect to database: %s\n", err)
 		os.Exit(1)
 	}
+	fmt.Println("Finished creating connections")
+
 	for j = 0; j < NUM_STREAMS; j++ {
 		s, err := d.Create(context.Background(), uuid.UUID(uuids[j]), uuid.UUID(uuids[j]).String(), nil, nil)
 		if err != nil {
@@ -241,7 +251,7 @@ func main() {
 		recvLocks[j] = &sync.Mutex{}
 	}
 
-	fmt.Println("Finished creating connections")
+	fmt.Println("Finished creating streams")
 
 	sig := make(chan int)
 	idToChannel := make([]chan uint32, NUM_STREAMS)
@@ -324,7 +334,7 @@ func main() {
 	}()
 
 	for k := 0; k < NUM_STREAMS*TCP_CONNECTIONS; k++ {
-		_ = <-sig
+		<-sig
 	}
 
 	deltaT := time.Now().UnixNano() - startTime
