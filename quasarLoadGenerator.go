@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"math"
 	"math/rand"
@@ -66,8 +65,28 @@ func getSinusoidValue(time int64, randGen *rand.Rand) float64 {
 	return sines[sinesIndex]
 }
 
-func insert_data(s *btrdb.Stream, sig chan int) {
+func insert_data(datas [][]btrdb.RawPoint, startTime *int64, con chan uint32,
+	sig chan int, sendLock *sync.Mutex, recvLock *sync.Mutex, perm_size int64,
+	s *btrdb.Stream) {
+	var current int64 = 0
+	for current < perm_size {
+		recvLock.Lock()
+		current = *startTime
+		*startTime++
+		recvLock.Unlock()
 
+		con <- 0
+		//sendLock.Lock()
+		go func() {
+			sendErr := s.Insert(context.Background(), datas[current])
+			<-con
+			if sendErr != nil {
+				fmt.Printf("Error in sending request: %v\n", sendErr)
+				os.Exit(1)
+			}
+		}()
+
+	}
 	sig <- 0
 }
 
@@ -83,10 +102,6 @@ func getIntFromConfig(key string, config map[string]interface{}) int64 {
 		os.Exit(1)
 	}
 	return intval
-}
-
-func getServer(uuid []byte) int {
-	return int(uint(uuid[0]) % uint(NUM_SERVERS))
 }
 
 func bitLength(x int64) uint {
@@ -106,17 +121,6 @@ func main() {
 	} else {
 		fmt.Println("Usage: use -i to insert data. To get a CPU profile, add a file name after -i.")
 		return
-	}
-
-	/* Check if the user has requested a CPU Profile. */
-	if len(args) > 1 {
-		f, err := os.Create(args[1])
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-		pprof.StartCPUProfile(f)
-		defer pprof.StopCPUProfile()
 	}
 
 	/* Read the configuration file. */
@@ -162,7 +166,6 @@ func main() {
 		fmt.Println("MAX_TIME_RANDOM_OFFSET must be nonnegative.")
 		os.Exit(1)
 	}
-	var nanosPerMessage uint64 = uint64(NANOS_BETWEEN_POINTS) * uint64(POINTS_PER_MESSAGE)
 
 	MAX_CONCURRENT_MESSAGES = uint64(maxConcurrentMessages)
 	MAX_TIME_RANDOM_OFFSET = float64(timeRandOffset)
@@ -189,42 +192,26 @@ func main() {
 	}
 	orderBitmask = (1 << orderBitlength) - 1
 
-	var seedGen *rand.Rand = rand.New(rand.NewSource(RAND_SEED))
-	var permGen *rand.Rand = rand.New(rand.NewSource(PERM_SEED))
-	var randGens []*rand.Rand = make([]*rand.Rand, NUM_STREAMS)
+	seedGen := rand.New(rand.NewSource(RAND_SEED))
+	permGen := rand.New(rand.NewSource(PERM_SEED))
 
 	var j int
 	var ok bool
 	var dbAddrStr interface{}
-	var dbAddrs []string = make([]string, NUM_SERVERS)
 	dbAddrStr, ok = config["DB_ADDR"]
 	if !ok {
 		fmt.Println("DB_ADDR cannot be found")
 		os.Exit(1)
 	}
-	dbAddrs[j] = dbAddrStr.(string)
+	dbAddr := dbAddrStr.(string)
 
-	var uuids [][]byte = make([][]byte, NUM_STREAMS)
+	uuids := make([][]byte, NUM_STREAMS)
 
-	var uuidStr interface{}
-	var uuidParsed uuid.UUID
 	for j = 0; j < NUM_STREAMS; j++ {
-		uuidStr, ok = config[fmt.Sprintf("UUID%v", j+1)]
-		if !ok {
-			break
-		}
-		uuidParsed = uuid.Parse(uuidStr.(string))
-		if uuidParsed == nil {
-			fmt.Printf("Invalid UUID %v\n", uuidStr)
-			os.Exit(1)
-		}
-		uuids[j] = []byte(uuidParsed)
+		uu := uuid.NewRandom()
+		uuids[j] = []byte(uu)
 	}
-	_, ok = config[fmt.Sprintf("UUID%v", j+1)]
-	if j != NUM_STREAMS || ok {
-		fmt.Println("The number of specified UUIDs must equal NUM_STREAMS.")
-		os.Exit(1)
-	}
+
 	fmt.Printf("Using UUIDs ")
 	for j = 0; j < NUM_STREAMS; j++ {
 		fmt.Printf("%s ", uuid.UUID(uuids[j]).String())
@@ -232,13 +219,13 @@ func main() {
 	fmt.Printf("\n")
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	var connections []*btrdb.Stream = make([]*btrdb.Stream, NUM_STREAMS)
-	var sendLocks []*sync.Mutex = make([]*sync.Mutex, NUM_STREAMS)
-	var recvLocks []*sync.Mutex = make([]*sync.Mutex, NUM_STREAMS)
-	var positions []uint64 = make([]uint64, NUM_STREAMS)
-	var datas [][]btrdb.RawPoint = make([][]btrdb.RawPoint, uint64(perm_size))
+	connections := make([]*btrdb.Stream, NUM_STREAMS)
+	sendLocks := make([]*sync.Mutex, NUM_STREAMS)
+	recvLocks := make([]*sync.Mutex, NUM_STREAMS)
 
-	d, err := btrdb.Connect(context.TODO(), dbAddrs[0])
+	datas := make([][]btrdb.RawPoint, uint64(perm_size))
+
+	d, err := btrdb.Connect(context.TODO(), dbAddr)
 	if err != nil {
 		fmt.Printf("Could not connect to database: %s\n", err)
 		os.Exit(1)
@@ -250,20 +237,24 @@ func main() {
 			os.Exit(1)
 		}
 		connections[j] = s
+		sendLocks[j] = &sync.Mutex{}
+		recvLocks[j] = &sync.Mutex{}
 	}
 
 	fmt.Println("Finished creating connections")
 
-	var sig chan int = make(chan int)
-	var idToChannel []chan uint32 = make([]chan uint32, NUM_STREAMS)
-	var cont chan uint32
+	sig := make(chan int)
+	idToChannel := make([]chan uint32, NUM_STREAMS)
 	var randGen *rand.Rand
-	var startTimes []int64 = make([]int64, NUM_STREAMS)
-	var perm [][]int64 = make([][]int64, NUM_STREAMS)
+	randGen = rand.New(rand.NewSource(seedGen.Int63()))
+
+	startTimes := make([]int64, NUM_STREAMS)
+	perm := make([][]int64, NUM_STREAMS)
 
 	var f int64
 	var u int64
 	for e := 0; e < NUM_STREAMS; e++ {
+		idToChannel[e] = make(chan uint32, MAX_CONCURRENT_MESSAGES)
 		perm[e] = make([]int64, perm_size)
 		if PERM_SEED == 0 {
 			for f = 0; f < perm_size; f++ {
@@ -277,38 +268,42 @@ func main() {
 		}
 	}
 	fmt.Println("Finished generating insert/query order")
+	//fmt.Println(perm)
 
-	for e := 0; e < NUM_STREAMS; e++ {
-		for u = 0; u < perm_size; u++ {
-			currTime := perm[e][u]
-
-			data := make([]btrdb.RawPoint, POINTS_PER_MESSAGE)
-			var i int
-			for i = 0; uint32(i) < POINTS_PER_MESSAGE; i++ {
-				if DETERMINISTIC_KV {
-					data[i] = btrdb.RawPoint{Time: currTime, Value: get_time_value(currTime, randGen)}
-				} else {
-					data[i] = btrdb.RawPoint{Time: (currTime + int64(randGen.Float64()*MAX_TIME_RANDOM_OFFSET)), Value: get_time_value(currTime, randGen)}
-				}
-				currTime += NANOS_BETWEEN_POINTS
+	for u = 0; u < perm_size; u++ {
+		currTime := perm[0][u]
+		datas[u] = make([]btrdb.RawPoint, POINTS_PER_MESSAGE)
+		var i int
+		for i = 0; uint32(i) < POINTS_PER_MESSAGE; i++ {
+			if DETERMINISTIC_KV {
+				datas[u][i] = btrdb.RawPoint{Time: currTime, Value: get_time_value(currTime, randGen)}
+			} else {
+				datas[u][i] = btrdb.RawPoint{Time: (currTime + int64(randGen.Float64()*MAX_TIME_RANDOM_OFFSET)), Value: get_time_value(currTime, randGen)}
 			}
-			datas[j] = data
+			currTime += NANOS_BETWEEN_POINTS
 		}
 	}
 
-	var finished bool = false
+	fmt.Println("Finished generating data")
+	//fmt.Println(datas)
+	/* Check if the user has requested a CPU Profile. */
+	if len(args) > 1 {
+		f, err := os.Create(args[1])
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 
-	var startTime int64 = time.Now().UnixNano()
+	finished := false
+	startTime := time.Now().UnixNano()
 
 	for z := 0; z < NUM_STREAMS; z++ {
-		cont = make(chan uint32, maxConcurrentMessages)
 		for i := 0; i < TCP_CONNECTIONS; i++ {
-			randGen = rand.New(rand.NewSource(seedGen.Int63()))
-			randGens[z] = randGen
-			startTimes[z] = FIRST_TIME
 			// datas sig cont
-			go send_messages(uuids[z], &startTimes[z], connections[serverIndex][connIndex].stream, sendLocks[serverIndex][connIndex], ConnectionID{serverIndex, connIndex}, sig, z, cont, randGen, perm[z], uint64(perm_size), transactionHistories[z])
-
+			go insert_data(datas, &startTimes[z], idToChannel[z], sig, sendLocks[z], recvLocks[z], perm_size, connections[z])
 		}
 	}
 
@@ -318,65 +313,35 @@ func main() {
 	go func() {
 		<-interrupt // block until an interrupt happens
 		fmt.Println("\nDetected ^C. Abruptly ending program...")
-		fmt.Println("The following are the start times of the messages that are currently being inserted/queried:")
-		for i := 0; i < NUM_STREAMS; i++ {
-			fmt.Printf("%v: %v\n", uuid.UUID(uuids[i]).String(), startTimes[i])
-		}
 		os.Exit(0)
+	}()
+
+	go func() {
+		for !finished {
+			time.Sleep(time.Second)
+			fmt.Printf("Sent %v, ", points_sent)
+		}
 	}()
 
 	for k := 0; k < NUM_STREAMS*TCP_CONNECTIONS; k++ {
 		_ = <-sig
 	}
 
-	var deltaT int64 = time.Now().UnixNano() - startTime
+	deltaT := time.Now().UnixNano() - startTime
 
 	// I used to close unused connections here, but now I don't bother
 
 	finished = true
-	fmt.Printf("Sent %v, Received %v\n", points_sent, points_received)
+	fmt.Printf("Sent %v\n", points_sent)
 
 	fmt.Println("Finished")
 
-	var numResPoints uint64 = uint64(TOTAL_RECORDS) * uint64(NUM_STREAMS)
+	numResPoints := uint64(TOTAL_RECORDS) * uint64(NUM_STREAMS)
 	fmt.Printf("Total time: %d nanoseconds for %d points\n", deltaT, numResPoints)
-	var average uint64 = 0
+	var average uint64
 	if numResPoints != 0 {
 		average = uint64(deltaT) / numResPoints
 	}
 	fmt.Printf("Average: %d nanoseconds per point (floored to integer value)\n", average)
 	fmt.Println(deltaT)
-
-	if GET_MESSAGE_TIMES {
-		file, err := os.Create("stats.json")
-		if err != nil {
-			fmt.Println("Could not write stats to file")
-			os.Exit(1)
-		}
-		writeSafe(file, "{\n")
-		for q := range transactionHistories {
-			writeSafe(file, fmt.Sprintf("\"%v\": [\n", uuid.UUID(uuids[q]).String()))
-			terminator := ","
-			for r := range transactionHistories[q] {
-				if r == len(transactionHistories[q])-1 {
-					terminator = ""
-				}
-				writeSafe(file, fmt.Sprintf("[%v,%v]%s\n", transactionHistories[q][r].sendTime, transactionHistories[q][r].respTime, terminator))
-			}
-			if q == len(transactionHistories)-1 {
-				writeSafe(file, "]\n")
-			} else {
-				writeSafe(file, "],\n")
-			}
-		}
-		writeSafe(file, "}\n")
-	}
-}
-
-func writeSafe(file *os.File, str string) {
-	written, err := io.WriteString(file, str)
-	if written != len(str) || err != nil {
-		fmt.Println("Could not write to file")
-		os.Exit(1)
-	}
 }
