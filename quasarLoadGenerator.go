@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math"
 	"math/rand"
@@ -11,10 +12,8 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"strconv"
-	"sync"
 	"time"
 
-	"github.com/BTrDB/btrdb"
 	pb "github.com/BTrDB/btrdb/grpcinterface"
 	cparse "github.com/SoftwareDefinedBuildings/sync2_quasar/configparser"
 	"github.com/pborman/uuid"
@@ -93,32 +92,13 @@ func getSinusoidValue(time int64, randGen *rand.Rand) float64 {
 	return sines[sinesIndex]
 }
 
-func insert_data(datas [][]pb.RawPoint, startTime *int64, con chan uint32,
-	sig chan int, sendLock *sync.Mutex, recvLock *sync.Mutex, perm_size int64,
-	s *btrdb.Stream) {
-	var current int64 = 0
-	recvLock.Lock()
-	current = *startTime
-	*startTime++
-	recvLock.Unlock()
-	for current < perm_size {
-
-		con <- 0
-
-		go func(c int64) {
-			sendErr := s.Insert(context.Background(), datas[c])
-			<-con
-			if sendErr != nil {
-				fmt.Printf("Error in sending request: %v\n", sendErr)
-				os.Exit(1)
-			}
-		}(current)
-
-		recvLock.Lock()
-		current = *startTime
-		*startTime++
-		recvLock.Unlock()
-
+func insert_data(datas [][]*pb.RawPoint, sig chan int, c pb.BTrDBClient, uu uuid.UUID) {
+	for _, d := range datas {
+		sendErr := inserter(c, uu, d)
+		if sendErr != nil {
+			fmt.Printf("Error in sending request: %v\n", sendErr)
+			os.Exit(1)
+		}
 	}
 	sig <- 0
 }
@@ -219,6 +199,12 @@ func main() {
 		remainder = 1
 	}
 	var perm_size = (TOTAL_RECORDS / int64(POINTS_PER_MESSAGE)) + remainder
+	if perm_size%int64(TCP_CONNECTIONS) != 0 {
+		fmt.Println("Number of connections needs to divide number of messages")
+		os.Exit(1)
+	}
+	n_mes := perm_size / int64(TCP_CONNECTIONS)
+
 	orderBitlength = bitLength(perm_size - 1)
 	if orderBitlength+bitLength(int64(NUM_STREAMS-1)) > 64 {
 		fmt.Println("The number of bits required to store (number of messages - 1) plus the number of bits required to store (NUM_STREAMS - 1) cannot exceed 64.")
@@ -239,59 +225,63 @@ func main() {
 	}
 	dbAddr := dbAddrStr.(string)
 
-	uuids := make([][]byte, NUM_STREAMS)
+	uuids := make([]uuid.UUID, NUM_STREAMS)
 
 	for j = 0; j < NUM_STREAMS; j++ {
-		uu := uuid.NewRandom()
-		uuids[j] = []byte(uu)
+		uuids[j] = uuid.NewRandom()
 	}
 
 	fmt.Printf("Using UUIDs ")
 	for j = 0; j < NUM_STREAMS; j++ {
-		fmt.Printf("%s ", uuid.UUID(uuids[j]).String())
+		fmt.Printf("%s ", uuids[j].String())
 	}
 	fmt.Printf("\n")
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	connections := make([]*btrdb.Stream, NUM_STREAMS)
-	sendLocks := make([]*sync.Mutex, NUM_STREAMS)
-	recvLocks := make([]*sync.Mutex, NUM_STREAMS)
+	connections := make([][]*Endpoint, NUM_STREAMS)
 
-	datas := make([][]btrdb.RawPoint, uint64(perm_size))
+	datas := make([][]*pb.RawPoint, uint64(perm_size))
 
-	d, err := btrdb.Connect(context.TODO(), dbAddr)
-
-	if err != nil {
-		fmt.Printf("Could not connect to database: %s\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("Finished creating connections")
-
+	d := connector(dbAddr)
 	for j = 0; j < NUM_STREAMS; j++ {
-		s, err := d.Create(context.Background(), uuid.UUID(uuids[j]), uuid.UUID(uuids[j]).String(), nil, nil)
+		rv, err := d.g.Create(context.Background(), &pb.CreateParams{
+			Uuid:        uuids[j],
+			Collection:  uuids[j].String(),
+			Tags:        nil,
+			Annotations: nil,
+		})
+
 		if err != nil {
 			fmt.Printf("Could not create stream: %s\n", err)
 			os.Exit(1)
 		}
-		connections[j] = s
-		sendLocks[j] = &sync.Mutex{}
-		recvLocks[j] = &sync.Mutex{}
+		if rv.GetStat() != nil {
+			fmt.Printf("Could not create stream: %s\n", &CodedError{rv.GetStat()})
+			os.Exit(1)
+		}
 	}
+	d.conn.Close()
 
 	fmt.Println("Finished creating streams")
 
+	for z := 0; z < NUM_STREAMS; z++ {
+		connections[z] = make([]*Endpoint, TCP_CONNECTIONS)
+		for i := 0; i < TCP_CONNECTIONS; i++ {
+			connections[z][i] = connector(dbAddr)
+		}
+	}
+
+	fmt.Println("Finished creating connections")
+
 	sig := make(chan int)
-	idToChannel := make([]chan uint32, NUM_STREAMS)
 	var randGen *rand.Rand
 	randGen = rand.New(rand.NewSource(seedGen.Int63()))
 
-	startTimes := make([]int64, NUM_STREAMS)
 	perm := make([][]int64, NUM_STREAMS)
 
 	var f int64
 	var u int64
 	for e := 0; e < NUM_STREAMS; e++ {
-		idToChannel[e] = make(chan uint32, MAX_CONCURRENT_MESSAGES)
 		perm[e] = make([]int64, perm_size)
 		if PERM_SEED == 0 {
 			for f = 0; f < perm_size; f++ {
@@ -309,20 +299,20 @@ func main() {
 
 	for u = 0; u < perm_size; u++ {
 		currTime := perm[0][u]
-		datas[u] = make([]btrdb.RawPoint, POINTS_PER_MESSAGE)
+		datas[u] = make([]*pb.RawPoint, POINTS_PER_MESSAGE)
 		var i int
 		for i = 0; uint32(i) < POINTS_PER_MESSAGE; i++ {
 			if DETERMINISTIC_KV {
-				datas[u][i] = btrdb.RawPoint{Time: currTime, Value: get_time_value(currTime, randGen)}
+				datas[u][i] = &pb.RawPoint{Time: currTime, Value: get_time_value(currTime, randGen)}
 			} else {
-				datas[u][i] = btrdb.RawPoint{Time: (currTime + int64(randGen.Float64()*MAX_TIME_RANDOM_OFFSET)), Value: get_time_value(currTime, randGen)}
+				datas[u][i] = &pb.RawPoint{Time: (currTime + int64(randGen.Float64()*MAX_TIME_RANDOM_OFFSET)), Value: get_time_value(currTime, randGen)}
 			}
 			currTime += NANOS_BETWEEN_POINTS
 		}
 	}
 
 	fmt.Println("Finished generating data")
-	//fmt.Println(datas)
+
 	/* Check if the user has requested a CPU Profile. */
 	if len(args) > 1 {
 		f, err := os.Create(args[1])
@@ -334,13 +324,14 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	finished := false
 	startTime := time.Now().UnixNano()
 
 	for z := 0; z < NUM_STREAMS; z++ {
+		var sta int64 = 0
 		for i := 0; i < TCP_CONNECTIONS; i++ {
 			// datas sig cont
-			go insert_data(datas, &startTimes[z], idToChannel[z], sig, sendLocks[z], recvLocks[z], perm_size, connections[z])
+			go insert_data(datas[sta:sta+n_mes], sig, connections[z][i].g, uuids[z])
+			sta += n_mes
 		}
 	}
 
@@ -353,13 +344,6 @@ func main() {
 		os.Exit(0)
 	}()
 
-	go func() {
-		for !finished {
-			time.Sleep(time.Second)
-			fmt.Printf("Sent %v, ", points_sent)
-		}
-	}()
-
 	for k := 0; k < NUM_STREAMS*TCP_CONNECTIONS; k++ {
 		<-sig
 	}
@@ -368,12 +352,54 @@ func main() {
 
 	// I used to close unused connections here, but now I don't bother
 
-	finished = true
-	fmt.Printf("Sent %v\n", points_sent)
-
 	fmt.Println("Finished")
 
 	numResPoints := uint64(TOTAL_RECORDS) * uint64(NUM_STREAMS)
+
+	var resultcount uint64 = 0
+	for z := 0; z < NUM_STREAMS; z++ {
+
+		rv, err := connections[z][0].g.Windows(context.Background(), &pb.WindowsParams{
+			Uuid:         uuids[z],
+			Start:        FIRST_TIME,
+			End:          TOTAL_RECORDS*NANOS_BETWEEN_POINTS + 100,
+			Width:        uint64(TOTAL_RECORDS*NANOS_BETWEEN_POINTS + 50),
+			Depth:        0,
+			VersionMajor: 0,
+		})
+		if err != nil {
+			fmt.Println("Failed reading")
+			os.Exit(1)
+		}
+		for {
+			rawv, err := rv.Recv()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+
+				fmt.Printf("Failed reading %s\n", err)
+				os.Exit(1)
+			}
+			if rawv.Stat != nil {
+
+				fmt.Printf("Failed reading %s\n", &CodedError{rawv.Stat})
+				os.Exit(1)
+			}
+			for _, x := range rawv.Values {
+				resultcount += x.Count
+			}
+		}
+		for i := 0; i < TCP_CONNECTIONS; i++ {
+			connections[z][i].conn.Close()
+		}
+	}
+	if resultcount != numResPoints {
+		fmt.Printf("POINTS WERE NOT WRITTEN EXPECTED %d GOT %d\n", numResPoints, resultcount)
+	} else {
+		fmt.Println("ALL GOOD")
+	}
+
 	fmt.Printf("Total time: %d nanoseconds for %d points\n", deltaT, numResPoints)
 	var average uint64
 	if numResPoints != 0 {
@@ -381,6 +407,7 @@ func main() {
 	}
 	fmt.Printf("Average: %d nanoseconds per point (floored to integer value)\n", average)
 	fmt.Println(deltaT)
+
 }
 
 //connector
@@ -421,8 +448,4 @@ func inserter(c pb.BTrDBClient, uu uuid.UUID, values []*pb.RawPoint) error {
 		return &CodedError{rv.GetStat()}
 	}
 	return nil
-}
-
-func destroy(b *grpc.ClientConn) {
-	b.Close()
 }
